@@ -39,6 +39,7 @@
 #include "private/bitmath.h"
 #include "private/bitreader.h"
 #include "private/crc.h"
+#include "private/lpc.h"
 #include "private/cpu.h"
 #include "private/macros.h"
 #include "FLAC/assert.h"
@@ -831,6 +832,8 @@ FLAC__bool FLAC__bitreader_read_rice_signed(FLAC__BitReader *br, int *val, uint3
 #endif
 
 /* this is by far the most heavily used reader call.  it ain't pretty but it's fast */
+#define FLAC__RICE_BLOCK_PROLOGUE
+#define FLAC__RICE_BLOCK_EMIT(residual) (*val++ = (residual))
 FLAC__bool FLAC__bitreader_read_rice_signed_block(FLAC__BitReader *br, int vals[], uint32_t nvals, uint32_t parameter)
 #include "deduplication/bitreader_read_rice_signed_block.c"
 
@@ -839,6 +842,216 @@ FLAC__SSE_TARGET("bmi2")
 FLAC__bool FLAC__bitreader_read_rice_signed_block_bmi2(FLAC__BitReader *br, int vals[], uint32_t nvals, uint32_t parameter)
 #include "deduplication/bitreader_read_rice_signed_block.c"
 #endif
+#undef FLAC__RICE_BLOCK_EMIT
+#undef FLAC__RICE_BLOCK_PROLOGUE
+
+/* Same, restoring each sample as soon as its residual is decoded instead of in a
+ * second pass. Decoding a rice code depends on the previous one through the bit
+ * position, restoring a sample on the previous samples: in one loop the two chains
+ * are independent and the CPU runs them in parallel. Same arithmetic as
+ * FLAC__lpc_restore_signal(); the residuals are still stored for the client. */
+#if defined(FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION) && !defined(FUZZING_BUILD_MODE_FLAC_SANITIZE_SIGNED_INTEGER_OVERFLOW)
+#define FLAC__RICE_BLOCK_NO_SANITIZE __attribute__((no_sanitize("signed-integer-overflow")))
+#else
+#define FLAC__RICE_BLOCK_NO_SANITIZE
+#endif
+#if defined(__GNUC__) || defined(__clang__)
+#define FLAC__RICE_BLOCK_ALWAYS_INLINE __attribute__((always_inline)) inline
+#elif defined(_MSC_VER)
+#define FLAC__RICE_BLOCK_ALWAYS_INLINE __forceinline
+#else
+#define FLAC__RICE_BLOCK_ALWAYS_INLINE inline
+#endif
+
+/* Orders up to 12 (the subset limit) are inlined with a constant order by the
+ * dispatchers below. The prediction of the next sample but its newest tap
+ * ("rest") is computed while the current sample is restored, so that the
+ * dependency between samples is one multiply-add, the shift and the residual
+ * add, whatever the compiler does with the order of the additions. The newest
+ * sample is kept in a scalar: reading it back would put a store-to-load round
+ * trip in that dependency. Where there are enough registers, the 11 older ones
+ * are kept in scalars too; x86 does not have enough, the window gets spilled
+ * and shifted in memory for each sample, so there they are read from data[],
+ * stored at least one sample earlier. FLAC__RICE_BLOCK_Hj is history sample j,
+ * H0 being the newest. */
+#if defined FLAC__CPU_X86_64 || defined FLAC__CPU_IA32
+#define FLAC__RICE_BLOCK_HISTORY FLAC__int32 h0 = order > 0 ? data[-1] : 0;
+#define FLAC__RICE_BLOCK_HISTORY_SHIFT
+#define FLAC__RICE_BLOCK_H1 data[-2]
+#define FLAC__RICE_BLOCK_H2 data[-3]
+#define FLAC__RICE_BLOCK_H3 data[-4]
+#define FLAC__RICE_BLOCK_H4 data[-5]
+#define FLAC__RICE_BLOCK_H5 data[-6]
+#define FLAC__RICE_BLOCK_H6 data[-7]
+#define FLAC__RICE_BLOCK_H7 data[-8]
+#define FLAC__RICE_BLOCK_H8 data[-9]
+#define FLAC__RICE_BLOCK_H9 data[-10]
+#define FLAC__RICE_BLOCK_H10 data[-11]
+#define FLAC__RICE_BLOCK_H11 data[-12]
+#else
+#define FLAC__RICE_BLOCK_HISTORY \
+	FLAC__int32 h0 = order > 0 ? data[-1] : 0, h1 = order > 1 ? data[-2] : 0, \
+	            h2 = order > 2 ? data[-3] : 0, h3 = order > 3 ? data[-4] : 0, \
+	            h4 = order > 4 ? data[-5] : 0, h5 = order > 5 ? data[-6] : 0, \
+	            h6 = order > 6 ? data[-7] : 0, h7 = order > 7 ? data[-8] : 0, \
+	            h8 = order > 8 ? data[-9] : 0, h9 = order > 9 ? data[-10] : 0, \
+	            h10 = order > 10 ? data[-11] : 0, h11 = order > 11 ? data[-12] : 0;
+#define FLAC__RICE_BLOCK_HISTORY_SHIFT \
+	h11 = h10; \
+	h10 = h9; \
+	h9 = h8; \
+	h8 = h7; \
+	h7 = h6; \
+	h6 = h5; \
+	h5 = h4; \
+	h4 = h3; \
+	h3 = h2; \
+	h2 = h1; \
+	h1 = h0;
+#define FLAC__RICE_BLOCK_H1 h1
+#define FLAC__RICE_BLOCK_H2 h2
+#define FLAC__RICE_BLOCK_H3 h3
+#define FLAC__RICE_BLOCK_H4 h4
+#define FLAC__RICE_BLOCK_H5 h5
+#define FLAC__RICE_BLOCK_H6 h6
+#define FLAC__RICE_BLOCK_H7 h7
+#define FLAC__RICE_BLOCK_H8 h8
+#define FLAC__RICE_BLOCK_H9 h9
+#define FLAC__RICE_BLOCK_H10 h10
+#define FLAC__RICE_BLOCK_H11 h11
+#endif
+#define FLAC__RICE_BLOCK_H0 h0
+/* tap(k, j) is coefficient k times history sample j. Integer addition being
+ * exact (modulo 2^32, resp. 2^64), the sums give the same result in any order;
+ * finish() adds the residual to the shifted prediction. */
+#define FLAC__RICE_BLOCK_WINDOW_PROLOGUE(sum_t, tap) \
+	FLAC__RICE_BLOCK_HISTORY \
+	sum_t rest = (tap(1, 1) + tap(2, 2) + tap(3, 3)) + (tap(4, 4) + tap(5, 5) + tap(6, 6)) + \
+	             (tap(7, 7) + tap(8, 8) + tap(9, 9)) + (tap(10, 10) + tap(11, 11));
+#define FLAC__RICE_BLOCK_WINDOW_EMIT(residual, sum_t, tap, finish) \
+	do { \
+		const int r_ = (residual); \
+		const sum_t next_rest_ = (tap(1, 0) + tap(2, 1) + tap(3, 2)) + (tap(4, 3) + tap(5, 4) + tap(6, 5)) + \
+		                         (tap(7, 6) + tap(8, 7) + tap(9, 8)) + (tap(10, 9) + tap(11, 10)); \
+		const FLAC__int32 x_ = finish(r_, rest + tap(0, 0)); \
+		*val++ = r_; \
+		FLAC__RICE_BLOCK_HISTORY_SHIFT \
+		h0 = x_; \
+		rest = next_rest_; \
+		*data++ = x_; \
+	} while(0)
+
+/* 32-bit prediction, as FLAC__lpc_restore_signal() */
+#define FLAC__RICE_BLOCK_TAP32(k, j) (order > (k) ? qlp_coeff[k] * FLAC__RICE_BLOCK_H##j : 0)
+#define FLAC__RICE_BLOCK_FINISH32(r, sum) ((r) + ((sum) >> lp_quantization))
+#define FLAC__RICE_BLOCK_PROLOGUE FLAC__RICE_BLOCK_WINDOW_PROLOGUE(FLAC__int32, FLAC__RICE_BLOCK_TAP32)
+#define FLAC__RICE_BLOCK_EMIT(residual) FLAC__RICE_BLOCK_WINDOW_EMIT(residual, FLAC__int32, FLAC__RICE_BLOCK_TAP32, FLAC__RICE_BLOCK_FINISH32)
+FLAC__RICE_BLOCK_NO_SANITIZE
+static FLAC__RICE_BLOCK_ALWAYS_INLINE FLAC__bool rice_block_restore_(FLAC__BitReader *br, int * flac_restrict vals, uint32_t nvals, uint32_t parameter, const FLAC__int32 * flac_restrict qlp_coeff, const uint32_t order, int lp_quantization, FLAC__int32 * flac_restrict data)
+#include "deduplication/bitreader_read_rice_signed_block.c"
+#undef FLAC__RICE_BLOCK_EMIT
+#undef FLAC__RICE_BLOCK_PROLOGUE
+
+/* 64-bit prediction, as FLAC__lpc_restore_signal_wide() */
+#define FLAC__RICE_BLOCK_TAP64(k, j) (order > (k) ? (FLAC__int64)qlp_coeff[k] * (FLAC__int64)FLAC__RICE_BLOCK_H##j : 0)
+#define FLAC__RICE_BLOCK_FINISH64(r, sum) ((FLAC__int32)((FLAC__int64)(r) + ((sum) >> lp_quantization)))
+#define FLAC__RICE_BLOCK_PROLOGUE FLAC__RICE_BLOCK_WINDOW_PROLOGUE(FLAC__int64, FLAC__RICE_BLOCK_TAP64)
+#define FLAC__RICE_BLOCK_EMIT(residual) FLAC__RICE_BLOCK_WINDOW_EMIT(residual, FLAC__int64, FLAC__RICE_BLOCK_TAP64, FLAC__RICE_BLOCK_FINISH64)
+FLAC__RICE_BLOCK_NO_SANITIZE
+static FLAC__RICE_BLOCK_ALWAYS_INLINE FLAC__bool rice_block_restore_wide_(FLAC__BitReader *br, int * flac_restrict vals, uint32_t nvals, uint32_t parameter, const FLAC__int32 * flac_restrict qlp_coeff, const uint32_t order, int lp_quantization, FLAC__int32 * flac_restrict data)
+#include "deduplication/bitreader_read_rice_signed_block.c"
+#undef FLAC__RICE_BLOCK_EMIT
+#undef FLAC__RICE_BLOCK_PROLOGUE
+
+/* Any order */
+#define FLAC__RICE_BLOCK_PROLOGUE
+#define FLAC__RICE_BLOCK_EMIT(residual) \
+	do { \
+		const int r_ = (residual); \
+		*val++ = r_; \
+		*data = FLAC__RICE_BLOCK_FINISH32(r_, FLAC__lpc_predict_32(qlp_coeff, order, data)); \
+		data++; \
+	} while(0)
+FLAC__RICE_BLOCK_NO_SANITIZE
+static FLAC__bool rice_block_restore_any_order_(FLAC__BitReader *br, int * flac_restrict vals, uint32_t nvals, uint32_t parameter, const FLAC__int32 * flac_restrict qlp_coeff, const uint32_t order, int lp_quantization, FLAC__int32 * flac_restrict data)
+#include "deduplication/bitreader_read_rice_signed_block.c"
+#undef FLAC__RICE_BLOCK_EMIT
+#define FLAC__RICE_BLOCK_EMIT(residual) \
+	do { \
+		const int r_ = (residual); \
+		*val++ = r_; \
+		*data = FLAC__RICE_BLOCK_FINISH64(r_, FLAC__lpc_predict_64(qlp_coeff, order, data)); \
+		data++; \
+	} while(0)
+FLAC__RICE_BLOCK_NO_SANITIZE
+static FLAC__bool rice_block_restore_wide_any_order_(FLAC__BitReader *br, int * flac_restrict vals, uint32_t nvals, uint32_t parameter, const FLAC__int32 * flac_restrict qlp_coeff, const uint32_t order, int lp_quantization, FLAC__int32 * flac_restrict data)
+#include "deduplication/bitreader_read_rice_signed_block.c"
+#undef FLAC__RICE_BLOCK_EMIT
+#undef FLAC__RICE_BLOCK_PROLOGUE
+#undef FLAC__RICE_BLOCK_WINDOW_EMIT
+#undef FLAC__RICE_BLOCK_WINDOW_PROLOGUE
+#undef FLAC__RICE_BLOCK_HISTORY
+#undef FLAC__RICE_BLOCK_HISTORY_SHIFT
+#undef FLAC__RICE_BLOCK_H0
+#undef FLAC__RICE_BLOCK_H1
+#undef FLAC__RICE_BLOCK_H2
+#undef FLAC__RICE_BLOCK_H3
+#undef FLAC__RICE_BLOCK_H4
+#undef FLAC__RICE_BLOCK_H5
+#undef FLAC__RICE_BLOCK_H6
+#undef FLAC__RICE_BLOCK_H7
+#undef FLAC__RICE_BLOCK_H8
+#undef FLAC__RICE_BLOCK_H9
+#undef FLAC__RICE_BLOCK_H10
+#undef FLAC__RICE_BLOCK_H11
+#undef FLAC__RICE_BLOCK_TAP32
+#undef FLAC__RICE_BLOCK_FINISH32
+#undef FLAC__RICE_BLOCK_TAP64
+#undef FLAC__RICE_BLOCK_FINISH64
+
+#define FLAC__RICE_BLOCK_RESTORE_DISPATCH(kernel, any_order_kernel) \
+	switch(order) { \
+		case  1: return kernel(br, vals, nvals, parameter, qlp_coeff,  1, lp_quantization, data); \
+		case  2: return kernel(br, vals, nvals, parameter, qlp_coeff,  2, lp_quantization, data); \
+		case  3: return kernel(br, vals, nvals, parameter, qlp_coeff,  3, lp_quantization, data); \
+		case  4: return kernel(br, vals, nvals, parameter, qlp_coeff,  4, lp_quantization, data); \
+		case  5: return kernel(br, vals, nvals, parameter, qlp_coeff,  5, lp_quantization, data); \
+		case  6: return kernel(br, vals, nvals, parameter, qlp_coeff,  6, lp_quantization, data); \
+		case  7: return kernel(br, vals, nvals, parameter, qlp_coeff,  7, lp_quantization, data); \
+		case  8: return kernel(br, vals, nvals, parameter, qlp_coeff,  8, lp_quantization, data); \
+		case  9: return kernel(br, vals, nvals, parameter, qlp_coeff,  9, lp_quantization, data); \
+		case 10: return kernel(br, vals, nvals, parameter, qlp_coeff, 10, lp_quantization, data); \
+		case 11: return kernel(br, vals, nvals, parameter, qlp_coeff, 11, lp_quantization, data); \
+		case 12: return kernel(br, vals, nvals, parameter, qlp_coeff, 12, lp_quantization, data); \
+		default: return any_order_kernel(br, vals, nvals, parameter, qlp_coeff, order, lp_quantization, data); \
+	}
+
+FLAC__bool FLAC__bitreader_read_rice_signed_block_restore(FLAC__BitReader *br, int * flac_restrict vals, uint32_t nvals, uint32_t parameter, const FLAC__int32 * flac_restrict qlp_coeff, uint32_t order, int lp_quantization, FLAC__int32 * flac_restrict data)
+{
+	FLAC__RICE_BLOCK_RESTORE_DISPATCH(rice_block_restore_, rice_block_restore_any_order_)
+}
+
+FLAC__bool FLAC__bitreader_read_rice_signed_block_restore_wide(FLAC__BitReader *br, int * flac_restrict vals, uint32_t nvals, uint32_t parameter, const FLAC__int32 * flac_restrict qlp_coeff, uint32_t order, int lp_quantization, FLAC__int32 * flac_restrict data)
+{
+	FLAC__RICE_BLOCK_RESTORE_DISPATCH(rice_block_restore_wide_, rice_block_restore_wide_any_order_)
+}
+
+#ifdef FLAC__BMI2_SUPPORTED
+FLAC__SSE_TARGET("bmi2")
+FLAC__bool FLAC__bitreader_read_rice_signed_block_restore_bmi2(FLAC__BitReader *br, int * flac_restrict vals, uint32_t nvals, uint32_t parameter, const FLAC__int32 * flac_restrict qlp_coeff, uint32_t order, int lp_quantization, FLAC__int32 * flac_restrict data)
+{
+	FLAC__RICE_BLOCK_RESTORE_DISPATCH(rice_block_restore_, rice_block_restore_any_order_)
+}
+
+FLAC__SSE_TARGET("bmi2")
+FLAC__bool FLAC__bitreader_read_rice_signed_block_restore_wide_bmi2(FLAC__BitReader *br, int * flac_restrict vals, uint32_t nvals, uint32_t parameter, const FLAC__int32 * flac_restrict qlp_coeff, uint32_t order, int lp_quantization, FLAC__int32 * flac_restrict data)
+{
+	FLAC__RICE_BLOCK_RESTORE_DISPATCH(rice_block_restore_wide_, rice_block_restore_wide_any_order_)
+}
+#endif
+#undef FLAC__RICE_BLOCK_RESTORE_DISPATCH
+#undef FLAC__RICE_BLOCK_ALWAYS_INLINE
+#undef FLAC__RICE_BLOCK_NO_SANITIZE
 
 #if 0 /* UNUSED */
 FLAC__bool FLAC__bitreader_read_golomb_signed(FLAC__BitReader *br, int *val, uint32_t parameter)

@@ -35,6 +35,7 @@
 
 #include <stdio.h> /* for FILE */
 #include "FLAC/ordinals.h"
+#include "share/compat.h" /* flac_restrict */
 #include "cpu.h"
 
 /*
@@ -90,6 +91,17 @@ FLAC__bool FLAC__bitreader_read_rice_signed(FLAC__BitReader *br, int *val, uint3
 FLAC__bool FLAC__bitreader_read_rice_signed_block(FLAC__BitReader *br, int vals[], uint32_t nvals, uint32_t parameter);
 #ifdef FLAC__BMI2_SUPPORTED
 FLAC__bool FLAC__bitreader_read_rice_signed_block_bmi2(FLAC__BitReader *br, int vals[], uint32_t nvals, uint32_t parameter);
+#endif
+/* Also restores data[i] = vals[i] + (prediction >> lp_quantization), see FLAC__lpc_predict_32().
+ * data[-order,-1] must hold the previous samples. */
+FLAC__bool FLAC__bitreader_read_rice_signed_block_restore(FLAC__BitReader *br, int *flac_restrict vals, uint32_t nvals, uint32_t parameter, const FLAC__int32 *flac_restrict qlp_coeff, uint32_t order, int lp_quantization, FLAC__int32 *flac_restrict data);
+#ifdef FLAC__BMI2_SUPPORTED
+FLAC__bool FLAC__bitreader_read_rice_signed_block_restore_bmi2(FLAC__BitReader *br, int *flac_restrict vals, uint32_t nvals, uint32_t parameter, const FLAC__int32 *flac_restrict qlp_coeff, uint32_t order, int lp_quantization, FLAC__int32 *flac_restrict data);
+#endif
+/* Same with the 64-bit prediction of FLAC__lpc_restore_signal_wide() */
+FLAC__bool FLAC__bitreader_read_rice_signed_block_restore_wide(FLAC__BitReader *br, int *flac_restrict vals, uint32_t nvals, uint32_t parameter, const FLAC__int32 *flac_restrict qlp_coeff, uint32_t order, int lp_quantization, FLAC__int32 *flac_restrict data);
+#ifdef FLAC__BMI2_SUPPORTED
+FLAC__bool FLAC__bitreader_read_rice_signed_block_restore_wide_bmi2(FLAC__BitReader *br, int *flac_restrict vals, uint32_t nvals, uint32_t parameter, const FLAC__int32 *flac_restrict qlp_coeff, uint32_t order, int lp_quantization, FLAC__int32 *flac_restrict data);
 #endif
 
 #if 0 /* UNUSED */

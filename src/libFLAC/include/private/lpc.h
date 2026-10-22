@@ -204,6 +204,67 @@ void FLAC__lpc_restore_signal(const FLAC__int32 residual[], uint32_t data_len, c
 void FLAC__lpc_restore_signal_wide(const FLAC__int32 residual[], uint32_t data_len, const FLAC__int32 qlp_coeff[], uint32_t order, int lp_quantization, FLAC__int32 data[]);
 void FLAC__lpc_restore_signal_wide_33bit(const FLAC__int32 residual[], uint32_t data_len, const FLAC__int32 qlp_coeff[], uint32_t order, int lp_quantization, FLAC__int64 data[]);
 
+/*
+ *	FLAC__lpc_predict_32()
+ *	--------------------------------------------------------------------
+ *	Prediction of one sample before the shift, with the 32-bit arithmetic
+ *	of FLAC__lpc_restore_signal(): only valid where that function is.
+ *	Inlined in loops that restore samples as residuals get decoded; the
+ *	switch on order is the same for a whole subframe, so it predicts well.
+ *
+ *	IN qlp_coeff[0,order-1]    quantized LP coefficients
+ *	IN order                   LP order, may be 0
+ *	IN data[-order,-1]         previously-reconstructed historical samples
+ *	RETURN                     sum of qlp_coeff[j] * data[-j-1]
+ */
+#if defined(FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION) && !defined(FUZZING_BUILD_MODE_FLAC_SANITIZE_SIGNED_INTEGER_OVERFLOW)
+/* see FLAC__lpc_restore_signal(): fuzzing feeds bogus predictors, the overflow is audio path only */
+__attribute__((no_sanitize("signed-integer-overflow")))
+#endif
+static inline FLAC__int32 FLAC__lpc_predict_32(const FLAC__int32 qlp_coeff[], uint32_t order, const FLAC__int32 data[])
+{
+	FLAC__int32 sum = 0;
+	uint32_t j;
+	switch(order) {
+		case 12: sum += qlp_coeff[11] * data[-12]; /* Falls through. */
+		case 11: sum += qlp_coeff[10] * data[-11]; /* Falls through. */
+		case 10: sum += qlp_coeff[ 9] * data[-10]; /* Falls through. */
+		case 9:  sum += qlp_coeff[ 8] * data[ -9]; /* Falls through. */
+		case 8:  sum += qlp_coeff[ 7] * data[ -8]; /* Falls through. */
+		case 7:  sum += qlp_coeff[ 6] * data[ -7]; /* Falls through. */
+		case 6:  sum += qlp_coeff[ 5] * data[ -6]; /* Falls through. */
+		case 5:  sum += qlp_coeff[ 4] * data[ -5]; /* Falls through. */
+		case 4:  sum += qlp_coeff[ 3] * data[ -4]; /* Falls through. */
+		case 3:  sum += qlp_coeff[ 2] * data[ -3]; /* Falls through. */
+		case 2:  sum += qlp_coeff[ 1] * data[ -2]; /* Falls through. */
+		case 1:  sum += qlp_coeff[ 0] * data[ -1]; /* Falls through. */
+		case 0:  break;
+		default:
+			for(j = 0; j < order; j++)
+				sum += qlp_coeff[j] * data[-(int)j - 1];
+			break;
+	}
+	return sum;
+}
+
+/*
+ *	FLAC__lpc_predict_64()
+ *	--------------------------------------------------------------------
+ *	Same as FLAC__lpc_predict_32() with the 64-bit arithmetic of
+ *	FLAC__lpc_restore_signal_wide().
+ */
+#if defined(FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION) && !defined(FUZZING_BUILD_MODE_FLAC_SANITIZE_SIGNED_INTEGER_OVERFLOW)
+__attribute__((no_sanitize("signed-integer-overflow")))
+#endif
+static inline FLAC__int64 FLAC__lpc_predict_64(const FLAC__int32 qlp_coeff[], uint32_t order, const FLAC__int32 data[])
+{
+	FLAC__int64 sum = 0;
+	uint32_t j;
+	for(j = 0; j < order; j++)
+		sum += (FLAC__int64)qlp_coeff[j] * (FLAC__int64)data[-(int)j - 1];
+	return sum;
+}
+
 #ifndef FLAC__INTEGER_ONLY_LIBRARY
 
 /*

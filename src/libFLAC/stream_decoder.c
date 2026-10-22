@@ -93,7 +93,7 @@ static FLAC__bool read_subframe_constant_(FLAC__StreamDecoder *decoder, uint32_t
 static FLAC__bool read_subframe_fixed_(FLAC__StreamDecoder *decoder, uint32_t channel, uint32_t bps, const uint32_t order, FLAC__bool do_full_decode);
 static FLAC__bool read_subframe_lpc_(FLAC__StreamDecoder *decoder, uint32_t channel, uint32_t bps, const uint32_t order, FLAC__bool do_full_decode);
 static FLAC__bool read_subframe_verbatim_(FLAC__StreamDecoder *decoder, uint32_t channel, uint32_t bps, FLAC__bool do_full_decode);
-static FLAC__bool read_residual_partitioned_rice_(FLAC__StreamDecoder *decoder, uint32_t predictor_order, uint32_t partition_order, FLAC__EntropyCodingMethod_PartitionedRiceContents *partitioned_rice_contents, FLAC__int32 *residual, FLAC__bool is_extended);
+static FLAC__bool read_residual_partitioned_rice_(FLAC__StreamDecoder *decoder, uint32_t predictor_order, uint32_t partition_order, FLAC__EntropyCodingMethod_PartitionedRiceContents *partitioned_rice_contents, FLAC__int32 *residual, FLAC__bool is_extended, const FLAC__int32 *qlp_coeff, int lp_quantization, FLAC__bool wide, FLAC__int32 *data);
 static FLAC__bool read_zero_padding_(FLAC__StreamDecoder *decoder);
 static void       undo_channel_coding(FLAC__StreamDecoder *decoder);
 static FLAC__bool read_callback_(FLAC__byte buffer[], size_t *bytes, void *client_data);
@@ -169,6 +169,8 @@ typedef struct FLAC__StreamDecoderPrivate {
 	uint32_t unparseable_frame_count; /* used to tell whether we're decoding a future version of FLAC or just got a bad sync */
 	FLAC__bool got_a_frame; /* hack needed in Ogg FLAC seek routine and find_total_samples to check when process_single() actually writes a frame */
 	FLAC__bool (*local_bitreader_read_rice_signed_block)(FLAC__BitReader *br, int vals[], uint32_t nvals, uint32_t parameter);
+	FLAC__bool (*local_bitreader_read_rice_signed_block_restore)(FLAC__BitReader *br, int *flac_restrict vals, uint32_t nvals, uint32_t parameter, const FLAC__int32 *flac_restrict qlp_coeff, uint32_t order, int lp_quantization, FLAC__int32 *flac_restrict data);
+	FLAC__bool (*local_bitreader_read_rice_signed_block_restore_wide)(FLAC__BitReader *br, int *flac_restrict vals, uint32_t nvals, uint32_t parameter, const FLAC__int32 *flac_restrict qlp_coeff, uint32_t order, int lp_quantization, FLAC__int32 *flac_restrict data);
 	FLAC__bool error_has_been_sent; /* To check whether a missing frame has been signalled yet */
 #if FLAC__HAS_OGG
 	FLAC__bool ogg_decoder_aspect_allocation_failure;
@@ -389,10 +391,14 @@ static FLAC__StreamDecoderInitStatus init_stream_internal_(
 
 	FLAC__cpu_info(&decoder->private_->cpuinfo);
 	decoder->private_->local_bitreader_read_rice_signed_block = FLAC__bitreader_read_rice_signed_block;
+	decoder->private_->local_bitreader_read_rice_signed_block_restore = FLAC__bitreader_read_rice_signed_block_restore;
+	decoder->private_->local_bitreader_read_rice_signed_block_restore_wide = FLAC__bitreader_read_rice_signed_block_restore_wide;
 
 #ifdef FLAC__BMI2_SUPPORTED
 	if (decoder->private_->cpuinfo.x86.bmi2) {
 		decoder->private_->local_bitreader_read_rice_signed_block = FLAC__bitreader_read_rice_signed_block_bmi2;
+		decoder->private_->local_bitreader_read_rice_signed_block_restore = FLAC__bitreader_read_rice_signed_block_restore_bmi2;
+		decoder->private_->local_bitreader_read_rice_signed_block_restore_wide = FLAC__bitreader_read_rice_signed_block_restore_wide_bmi2;
 	}
 #endif
 
@@ -3081,10 +3087,15 @@ FLAC__bool read_subframe_constant_(FLAC__StreamDecoder *decoder, uint32_t channe
 
 FLAC__bool read_subframe_fixed_(FLAC__StreamDecoder *decoder, uint32_t channel, uint32_t bps, const uint32_t order, FLAC__bool do_full_decode)
 {
+	/* FLAC__fixed_restore_signal() as LPC coefficients, quantization 0 */
+	static const FLAC__int32 fixed_predictor_coeffs[FLAC__MAX_FIXED_ORDER + 1][FLAC__MAX_FIXED_ORDER] = {
+		{ 0, 0, 0, 0 }, { 1, 0, 0, 0 }, { 2, -1, 0, 0 }, { 3, -3, 1, 0 }, { 4, -6, 4, -1 }
+	};
 	FLAC__Subframe_Fixed *subframe = &decoder->private_->frame.subframes[channel].data.fixed;
 	FLAC__int64 i64;
 	FLAC__uint32 u32;
 	uint32_t u;
+	FLAC__bool restore_while_reading;
 
 	decoder->private_->frame.subframes[channel].type = FLAC__SUBFRAME_TYPE_FIXED;
 
@@ -3122,11 +3133,19 @@ FLAC__bool read_subframe_fixed_(FLAC__StreamDecoder *decoder, uint32_t channel, 
 			return true;
 	}
 
+	/* Where the 32-bit restore applies, samples get restored while the residual is
+	 * read, the fixed predictor being the LPC one with these coefficients */
+	restore_while_reading = do_full_decode && bps + order <= 32;
+	if(restore_while_reading)
+		for(u = 0; u < order; u++)
+			decoder->private_->output[channel][u] = (FLAC__int32)subframe->warmup[u];
+
 	/* read residual */
 	switch(subframe->entropy_coding_method.type) {
 		case FLAC__ENTROPY_CODING_METHOD_PARTITIONED_RICE:
 		case FLAC__ENTROPY_CODING_METHOD_PARTITIONED_RICE2:
-			if(!read_residual_partitioned_rice_(decoder, order, subframe->entropy_coding_method.data.partitioned_rice.order, &decoder->private_->partitioned_rice_contents[channel], decoder->private_->residual[channel], /*is_extended=*/subframe->entropy_coding_method.type == FLAC__ENTROPY_CODING_METHOD_PARTITIONED_RICE2))
+			if(!read_residual_partitioned_rice_(decoder, order, subframe->entropy_coding_method.data.partitioned_rice.order, &decoder->private_->partitioned_rice_contents[channel], decoder->private_->residual[channel], /*is_extended=*/subframe->entropy_coding_method.type == FLAC__ENTROPY_CODING_METHOD_PARTITIONED_RICE2,
+												fixed_predictor_coeffs[order], 0, /*wide=*/false, restore_while_reading ? decoder->private_->output[channel] + order : NULL))
 				return false;
 			break;
 		default:
@@ -3134,7 +3153,7 @@ FLAC__bool read_subframe_fixed_(FLAC__StreamDecoder *decoder, uint32_t channel, 
 	}
 
 	/* decode the subframe */
-	if(do_full_decode) {
+	if(do_full_decode && !restore_while_reading) {
 		if(bps < 33){
 			uint32_t i;
 			for(i = 0; i < order; i++)
@@ -3161,6 +3180,7 @@ FLAC__bool read_subframe_lpc_(FLAC__StreamDecoder *decoder, uint32_t channel, ui
 	FLAC__int64 i64;
 	FLAC__uint32 u32;
 	uint32_t u;
+	FLAC__bool restore_while_reading, wide;
 
 	decoder->private_->frame.subframes[channel].type = FLAC__SUBFRAME_TYPE_LPC;
 
@@ -3225,11 +3245,22 @@ FLAC__bool read_subframe_lpc_(FLAC__StreamDecoder *decoder, uint32_t channel, ui
 			return true;
 	}
 
+	/* Up to 32 bps, samples get restored while the residual is read, with the
+	 * 32-bit prediction where FLAC__lpc_restore_signal() applies, else the 64-bit
+	 * one of FLAC__lpc_restore_signal_wide() */
+	restore_while_reading = do_full_decode && bps <= 32;
+	wide = !(FLAC__lpc_max_residual_bps(bps, subframe->qlp_coeff, order, subframe->quantization_level) <= 32 &&
+			 FLAC__lpc_max_prediction_before_shift_bps(bps, subframe->qlp_coeff, order) <= 32);
+	if(restore_while_reading)
+		for(u = 0; u < order; u++)
+			decoder->private_->output[channel][u] = (FLAC__int32)subframe->warmup[u];
+
 	/* read residual */
 	switch(subframe->entropy_coding_method.type) {
 		case FLAC__ENTROPY_CODING_METHOD_PARTITIONED_RICE:
 		case FLAC__ENTROPY_CODING_METHOD_PARTITIONED_RICE2:
-			if(!read_residual_partitioned_rice_(decoder, order, subframe->entropy_coding_method.data.partitioned_rice.order, &decoder->private_->partitioned_rice_contents[channel], decoder->private_->residual[channel], /*is_extended=*/subframe->entropy_coding_method.type == FLAC__ENTROPY_CODING_METHOD_PARTITIONED_RICE2))
+			if(!read_residual_partitioned_rice_(decoder, order, subframe->entropy_coding_method.data.partitioned_rice.order, &decoder->private_->partitioned_rice_contents[channel], decoder->private_->residual[channel], /*is_extended=*/subframe->entropy_coding_method.type == FLAC__ENTROPY_CODING_METHOD_PARTITIONED_RICE2,
+												subframe->qlp_coeff, subframe->quantization_level, wide, restore_while_reading ? decoder->private_->output[channel] + order : NULL))
 				return false;
 			break;
 		default:
@@ -3237,7 +3268,7 @@ FLAC__bool read_subframe_lpc_(FLAC__StreamDecoder *decoder, uint32_t channel, ui
 	}
 
 	/* decode the subframe */
-	if(do_full_decode) {
+	if(do_full_decode && !restore_while_reading) {
 		if(bps <= 32) {
 			uint32_t i;
 			for(i = 0; i < order; i++)
@@ -3298,7 +3329,24 @@ FLAC__bool read_subframe_verbatim_(FLAC__StreamDecoder *decoder, uint32_t channe
 	return true;
 }
 
-FLAC__bool read_residual_partitioned_rice_(FLAC__StreamDecoder *decoder, uint32_t predictor_order, uint32_t partition_order, FLAC__EntropyCodingMethod_PartitionedRiceContents *partitioned_rice_contents, FLAC__int32 *residual, FLAC__bool is_extended)
+#if defined(FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION) && !defined(FUZZING_BUILD_MODE_FLAC_SANITIZE_SIGNED_INTEGER_OVERFLOW)
+__attribute__((no_sanitize("signed-integer-overflow")))
+#endif
+static void restore_escaped_partition_(const FLAC__int32 *residual, uint32_t n, const FLAC__int32 *qlp_coeff, uint32_t order, int lp_quantization, FLAC__bool wide, FLAC__int32 *data)
+{
+	uint32_t i;
+	if(wide)
+		for(i = 0; i < n; i++)
+			data[i] = (FLAC__int32)(residual[i] + (FLAC__lpc_predict_64(qlp_coeff, order, data + i) >> lp_quantization));
+	else
+		for(i = 0; i < n; i++)
+			data[i] = residual[i] + (FLAC__lpc_predict_32(qlp_coeff, order, data + i) >> lp_quantization);
+}
+
+/* With data (output past the warm-up samples), also restores the samples with the
+ * LPC predictor (qlp_coeff, predictor_order, lp_quantization; 64-bit arithmetic if
+ * wide) as residuals get decoded, see FLAC__bitreader_read_rice_signed_block_restore() */
+FLAC__bool read_residual_partitioned_rice_(FLAC__StreamDecoder *decoder, uint32_t predictor_order, uint32_t partition_order, FLAC__EntropyCodingMethod_PartitionedRiceContents *partitioned_rice_contents, FLAC__int32 *residual, FLAC__bool is_extended, const FLAC__int32 *qlp_coeff, int lp_quantization, FLAC__bool wide, FLAC__int32 *data)
 {
 	FLAC__uint32 rice_parameter;
 	int i;
@@ -3322,9 +3370,16 @@ FLAC__bool read_residual_partitioned_rice_(FLAC__StreamDecoder *decoder, uint32_
 			return false; /* read_callback_ sets the state for us */
 		partitioned_rice_contents->parameters[partition] = rice_parameter;
 		if(rice_parameter < pesc) {
+			FLAC__bool ok;
 			partitioned_rice_contents->raw_bits[partition] = 0;
 			u = (partition == 0) ? partition_samples - predictor_order : partition_samples;
-			if(!decoder->private_->local_bitreader_read_rice_signed_block(decoder->private_->input, residual + sample, u, rice_parameter)){
+			if(!data)
+				ok = decoder->private_->local_bitreader_read_rice_signed_block(decoder->private_->input, residual + sample, u, rice_parameter);
+			else if(!wide)
+				ok = decoder->private_->local_bitreader_read_rice_signed_block_restore(decoder->private_->input, residual + sample, u, rice_parameter, qlp_coeff, predictor_order, lp_quantization, data + sample);
+			else
+				ok = decoder->private_->local_bitreader_read_rice_signed_block_restore_wide(decoder->private_->input, residual + sample, u, rice_parameter, qlp_coeff, predictor_order, lp_quantization, data + sample);
+			if(!ok) {
 				if(decoder->protected_->state == FLAC__STREAM_DECODER_READ_FRAME) {
 					/* no error was set, read_callback_ didn't set it, so
 					 * invalid rice symbol was found */
@@ -3338,6 +3393,7 @@ FLAC__bool read_residual_partitioned_rice_(FLAC__StreamDecoder *decoder, uint32_
 			sample += u;
 		}
 		else {
+			const uint32_t escaped_start = sample;
 			if(!FLAC__bitreader_read_raw_uint32(decoder->private_->input, &rice_parameter, FLAC__ENTROPY_CODING_METHOD_PARTITIONED_RICE_RAW_LEN))
 				return false; /* read_callback_ sets the state for us */
 			partitioned_rice_contents->raw_bits[partition] = rice_parameter;
@@ -3352,6 +3408,8 @@ FLAC__bool read_residual_partitioned_rice_(FLAC__StreamDecoder *decoder, uint32_
 					residual[sample] = i;
 				}
 			}
+			if(data)
+				restore_escaped_partition_(residual + escaped_start, sample - escaped_start, qlp_coeff, predictor_order, lp_quantization, wide, data + escaped_start);
 		}
 	}
 

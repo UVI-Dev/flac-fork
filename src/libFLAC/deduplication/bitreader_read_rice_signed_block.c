@@ -6,6 +6,7 @@
 	uint32_t ucbits; /* keep track of the number of unconsumed bits in word */
 	brword b;
 	int *val, *end;
+	FLAC__RICE_BLOCK_PROLOGUE
 
 	FLAC__ASSERT(0 != br);
 	FLAC__ASSERT(0 != br->buffer);
@@ -80,7 +81,7 @@
 
 		/* compose the value */
 		x = (msbs << parameter) | lsbs;
-		*val++ = (int)(x >> 1) ^ -(int)(x & 1);
+		FLAC__RICE_BLOCK_EMIT((int)(x >> 1) ^ -(int)(x & 1));
 
 		continue;
 
@@ -112,7 +113,7 @@ incomplete_lsbs:
 
 			/* compose the value */
 			x = (msbs << parameter) | lsbs;
-			*val++ = (int)(x >> 1) ^ -(int)(x & 1);
+			FLAC__RICE_BLOCK_EMIT((int)(x >> 1) ^ -(int)(x & 1));
 			x = 0;
 
 			cwords = br->consumed_words;
