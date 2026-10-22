@@ -19,21 +19,6 @@
 	val = vals;
 	end = vals + nvals;
 
-	if(parameter == 0) {
-		while(val < end) {
-			/* read the unary MSBs and end bit */
-			if(!FLAC__bitreader_read_unary_unsigned(br, &msbs))
-				return false;
-			/* Checking limit here would be overzealous: coding UINT32_MAX
-			 * with parameter == 0 would take 4GiB */
-			*val++ = (int)(msbs >> 1) ^ -(int)(msbs & 1);
-		}
-
-		return true;
-	}
-
-	FLAC__ASSERT(parameter > 0);
-
 	cwords = br->consumed_words;
 	words = br->words;
 
@@ -69,12 +54,15 @@
 		if(x > limit)
 			return false;
 
-		/* read the binary LSBs */
-		x = (FLAC__uint32)(b >> (FLAC__BITS_PER_WORD - parameter)); /* parameter < 32, so we can cast to 32-bit uint32_t */
-		if(parameter <= ucbits) {
+		/* read the binary LSBs; parameter 0 has none */
+		if(parameter == 0)
+			x = 0;
+		else if(parameter <= ucbits) {
+			x = (FLAC__uint32)(b >> (FLAC__BITS_PER_WORD - parameter)); /* parameter < 32, so we can cast to 32-bit uint32_t */
 			ucbits -= parameter;
 			b <<= parameter;
 		} else {
+			x = (FLAC__uint32)(b >> (FLAC__BITS_PER_WORD - parameter));
 			/* there are still bits left to read, they will all be in the next word */
 			cwords++;
 			if (cwords >= words)
