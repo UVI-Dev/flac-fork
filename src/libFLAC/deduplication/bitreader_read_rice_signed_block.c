@@ -47,21 +47,25 @@
 			} while(y == FLAC__BITS_PER_WORD);
 		}
 		b <<= y;
-		b <<= 1; /* account for stop bit */
 		ucbits = (ucbits - x - 1) % FLAC__BITS_PER_WORD;
 		msbs = x;
 
 		if(x > limit)
 			return false;
 
-		/* read the binary LSBs; parameter 0 has none */
-		if(parameter == 0)
+		/* read the binary LSBs; parameter 0 has none. The stop bit and the
+		 * LSBs are dropped from b with one shift (parameter + 1 <= 32): b
+		 * goes from one residual to the next, one shift less on that chain. */
+		if(parameter == 0) {
 			x = 0;
+			b <<= 1;
+		}
 		else if(parameter <= ucbits) {
-			x = (FLAC__uint32)(b >> (FLAC__BITS_PER_WORD - parameter)); /* parameter < 32, so we can cast to 32-bit uint32_t */
+			x = (FLAC__uint32)((b << 1) >> (FLAC__BITS_PER_WORD - parameter)); /* parameter < 32, so we can cast to 32-bit uint32_t */
 			ucbits -= parameter;
-			b <<= parameter;
+			b <<= parameter + 1;
 		} else {
+			b <<= 1; /* account for stop bit */
 			x = (FLAC__uint32)(b >> (FLAC__BITS_PER_WORD - parameter));
 			/* there are still bits left to read, they will all be in the next word */
 			cwords++;
