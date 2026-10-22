@@ -503,3 +503,54 @@ FLAC__uint16 FLAC__crc16_update_words64(const FLAC__uint64 *words, uint32_t len,
 	return crc16_update_words64_table_(words, len, crc);
 }
 #endif
+
+#if defined FLAC__CPU_X86_64 && FLAC__HAS_X86INTRIN && defined FLAC__PCLMUL_SUPPORTED
+#include <wmmintrin.h> /* PCLMULQDQ */
+#include <smmintrin.h> /* SSE4.1 */
+
+/* Same folding as the PMULL version above, with PCLMULQDQ: an accumulator has
+ * the low 64 bits in the low lane, so a block of two words is loaded swapped. */
+FLAC__SSE_TARGET("pclmul,sse4.1")
+static inline __m128i crc16_fold_pclmul_(__m128i acc, __m128i k)
+{
+	return _mm_xor_si128(_mm_clmulepi64_si128(acc, k, 0x00), _mm_clmulepi64_si128(acc, k, 0x11));
+}
+
+FLAC__SSE_TARGET("pclmul,sse4.1")
+static inline __m128i crc16_load_block_pclmul_(const FLAC__uint64 *words)
+{
+	return _mm_shuffle_epi32(_mm_loadu_si128((const __m128i *)words), 0x4E);
+}
+
+FLAC__SSE_TARGET("pclmul,sse4.1")
+FLAC__uint16 FLAC__crc16_update_words64_pclmul(const FLAC__uint64 *words, uint32_t len, FLAC__uint16 crc)
+{
+	/* high lane: x^(128 * blocks + 64) mod P, low lane: x^(128 * blocks) mod P */
+	const __m128i k128 = _mm_set_epi64x(0x1666, 0x0106);
+	const __m128i k256 = _mm_set_epi64x(0x9323, 0x8011);
+	FLAC__uint64 tail[2];
+	__m128i acc0, acc1;
+	uint32_t i;
+
+	/* below a few words the table is as fast as setting the folding up */
+	if(len < 8)
+		return crc16_update_words64_table_(words, len, crc);
+
+	acc0 = _mm_xor_si128(crc16_load_block_pclmul_(words), _mm_set_epi64x((long long)((FLAC__uint64)crc << 48), 0));
+	acc1 = crc16_load_block_pclmul_(words + 2);
+	for(i = 4; i + 4 <= len; i += 4) {
+		acc0 = _mm_xor_si128(crc16_fold_pclmul_(acc0, k256), crc16_load_block_pclmul_(words + i));
+		acc1 = _mm_xor_si128(crc16_fold_pclmul_(acc1, k256), crc16_load_block_pclmul_(words + i + 2));
+	}
+	acc0 = _mm_xor_si128(crc16_fold_pclmul_(acc0, k128), acc1);
+	if(i + 2 <= len) {
+		acc0 = _mm_xor_si128(crc16_fold_pclmul_(acc0, k128), crc16_load_block_pclmul_(words + i));
+		i += 2;
+	}
+
+	tail[0] = (FLAC__uint64)_mm_extract_epi64(acc0, 1);
+	tail[1] = (FLAC__uint64)_mm_cvtsi128_si64(acc0);
+	crc = crc16_update_words64_table_(tail, 2, 0);
+	return crc16_update_words64_table_(words + i, len - i, crc);
+}
+#endif

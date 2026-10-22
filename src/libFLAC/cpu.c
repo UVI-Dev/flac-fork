@@ -61,6 +61,7 @@ static const uint32_t FLAC__CPUINFO_X86_CPUID_SSE2    = 0x04000000;
 static const uint32_t FLAC__CPUINFO_X86_CPUID_SSE3    = 0x00000001;
 static const uint32_t FLAC__CPUINFO_X86_CPUID_SSSE3   = 0x00000200;
 static const uint32_t FLAC__CPUINFO_X86_CPUID_SSE41   = 0x00080000;
+static const uint32_t FLAC__CPUINFO_X86_CPUID_PCLMUL  = 0x00000002;
 static const uint32_t FLAC__CPUINFO_X86_CPUID_SSE42   = 0x00100000;
 static const uint32_t FLAC__CPUINFO_X86_CPUID_OSXSAVE = 0x08000000;
 static const uint32_t FLAC__CPUINFO_X86_CPUID_AVX     = 0x10000000;
@@ -172,6 +173,7 @@ x86_cpu_info (FLAC__CPUInfo *info)
 	info->x86.ssse3 = (flags_ecx & FLAC__CPUINFO_X86_CPUID_SSSE3) ? true : false;
 	info->x86.sse41 = (flags_ecx & FLAC__CPUINFO_X86_CPUID_SSE41) ? true : false;
 	info->x86.sse42 = (flags_ecx & FLAC__CPUINFO_X86_CPUID_SSE42) ? true : false;
+	info->x86.pclmul = (flags_ecx & FLAC__CPUINFO_X86_CPUID_PCLMUL) ? true : false;
 
 	if (FLAC__AVX_SUPPORTED) {
 		x86_osxsave     = (flags_ecx & FLAC__CPUINFO_X86_CPUID_OSXSAVE) ? true : false;

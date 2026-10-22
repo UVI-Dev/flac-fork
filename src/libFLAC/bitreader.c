@@ -113,6 +113,9 @@ struct FLAC__BitReader {
 	uint32_t read_crc16; /* the running frame CRC */
 	uint32_t crc16_offset; /* the number of words in the current buffer that should not be CRC'd */
 	uint32_t crc16_align; /* the number of bits in the current consumed word that should not be CRC'd */
+#if FLAC__BYTES_PER_WORD == 8
+	FLAC__uint16 (*crc16_update_words64)(const FLAC__uint64 *words, uint32_t len, FLAC__uint16 crc);
+#endif
 	FLAC__bool read_limit_set; /* whether reads are limited */
 	uint32_t read_limit; /* the remaining size of what can be read */
 	uint32_t last_seen_framesync; /* the location of the last seen framesync, if it is in the buffer, in bits from front of buffer */
@@ -143,7 +146,7 @@ static inline void crc16_update_block_(FLAC__BitReader *br)
 #if FLAC__BYTES_PER_WORD == 4
 		br->read_crc16 = FLAC__crc16_update_words32(br->buffer + br->crc16_offset, br->consumed_words - br->crc16_offset, br->read_crc16);
 #elif FLAC__BYTES_PER_WORD == 8
-		br->read_crc16 = FLAC__crc16_update_words64(br->buffer + br->crc16_offset, br->consumed_words - br->crc16_offset, br->read_crc16);
+		br->read_crc16 = br->crc16_update_words64(br->buffer + br->crc16_offset, br->consumed_words - br->crc16_offset, br->read_crc16);
 #else
 		unsigned i;
 
@@ -296,6 +299,9 @@ FLAC__bool FLAC__bitreader_init(FLAC__BitReader *br, FLAC__BitReaderReadCallback
 		return false;
 	br->read_callback = rcb;
 	br->client_data = cd;
+#if FLAC__BYTES_PER_WORD == 8
+	br->crc16_update_words64 = FLAC__crc16_update_words64;
+#endif
 	br->read_limit_set = false;
 	br->read_limit = -1;
 	br->last_seen_framesync = -1;
@@ -377,6 +383,17 @@ FLAC__uint16 FLAC__bitreader_get_read_crc16(FLAC__BitReader *br)
 			br->read_crc16 = FLAC__CRC16_UPDATE((uint32_t)((tail >> (FLAC__BITS_PER_WORD-8-br->crc16_align)) & 0xff), br->read_crc16);
 	}
 	return br->read_crc16;
+}
+
+void FLAC__bitreader_set_cpu_info(FLAC__BitReader *br, const FLAC__CPUInfo *cpuinfo)
+{
+	FLAC__ASSERT(0 != br);
+	(void)br;
+	(void)cpuinfo;
+#if FLAC__BYTES_PER_WORD == 8 && defined FLAC__CPU_X86_64 && FLAC__HAS_X86INTRIN && defined FLAC__PCLMUL_SUPPORTED
+	if(cpuinfo->x86.pclmul && cpuinfo->x86.sse41)
+		br->crc16_update_words64 = FLAC__crc16_update_words64_pclmul;
+#endif
 }
 
 FLAC__bool FLAC__bitreader_is_consumed_byte_aligned(const FLAC__BitReader *br)

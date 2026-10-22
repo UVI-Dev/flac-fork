@@ -34,6 +34,7 @@
 #define FLAC__PRIVATE__CRC_H
 
 #include "FLAC/ordinals.h"
+#include "private/cpu.h"
 
 /* 8 bit CRC generator, MSB shifted first
 ** polynomial = x^8 + x^2 + x^1 + x^0
@@ -56,5 +57,9 @@ extern FLAC__uint16 const FLAC__crc16_table[8][256];
 FLAC__uint16 FLAC__crc16(const FLAC__byte *data, uint32_t len);
 FLAC__uint16 FLAC__crc16_update_words32(const FLAC__uint32 *words, uint32_t len, FLAC__uint16 crc);
 FLAC__uint16 FLAC__crc16_update_words64(const FLAC__uint64 *words, uint32_t len, FLAC__uint16 crc);
+#if defined FLAC__CPU_X86_64 && FLAC__HAS_X86INTRIN && defined FLAC__PCLMUL_SUPPORTED
+/* same with PCLMULQDQ; only call it when FLAC__CPUInfo_x86.pclmul and .sse41 are set */
+FLAC__uint16 FLAC__crc16_update_words64_pclmul(const FLAC__uint64 *words, uint32_t len, FLAC__uint16 crc);
+#endif
 
 #endif

@@ -62,6 +62,8 @@ FLAC__bool FLAC__bitreader_rewind_to_after_last_seen_framesync(FLAC__BitReader *
  */
 void FLAC__bitreader_reset_read_crc16(FLAC__BitReader *br, FLAC__uint16 seed);
 FLAC__uint16 FLAC__bitreader_get_read_crc16(FLAC__BitReader *br);
+/* Picks the fastest CRC-16 code for this CPU; call after FLAC__bitreader_init() */
+void FLAC__bitreader_set_cpu_info(FLAC__BitReader *br, const FLAC__CPUInfo *cpuinfo);
 
 /*
  * info functions
