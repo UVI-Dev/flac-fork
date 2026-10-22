@@ -3482,6 +3482,14 @@ void undo_channel_coding(FLAC__StreamDecoder *decoder) {
 	case FLAC__CHANNEL_ASSIGNMENT_LEFT_SIDE:
 		FLAC__ASSERT(decoder->private_->frame.header.channels == 2);
 		FLAC__ASSERT(decoder->private_->side_subframe_in_use != /* logical XOR */ (decoder->private_->frame.header.bits_per_sample < 32));
+		if(!decoder->private_->side_subframe_in_use) {
+			/* without the test in the loop, and with restrict, this loop vectorizes */
+			const FLAC__int32 *flac_restrict left = decoder->private_->output[0];
+			FLAC__int32 *flac_restrict side = decoder->private_->output[1];
+			for(i = 0; i < decoder->private_->frame.header.blocksize; i++)
+				side[i] = left[i] - side[i];
+			break;
+		}
 		for(i = 0; i < decoder->private_->frame.header.blocksize; i++)
 			if(decoder->private_->side_subframe_in_use)
 				decoder->private_->output[1][i] = decoder->private_->output[0][i] - decoder->private_->side_subframe[i];
@@ -3491,6 +3499,13 @@ void undo_channel_coding(FLAC__StreamDecoder *decoder) {
 	case FLAC__CHANNEL_ASSIGNMENT_RIGHT_SIDE:
 		FLAC__ASSERT(decoder->private_->frame.header.channels == 2);
 		FLAC__ASSERT(decoder->private_->side_subframe_in_use != /* logical XOR */ (decoder->private_->frame.header.bits_per_sample < 32));
+		if(!decoder->private_->side_subframe_in_use) {
+			FLAC__int32 *flac_restrict side = decoder->private_->output[0];
+			const FLAC__int32 *flac_restrict right = decoder->private_->output[1];
+			for(i = 0; i < decoder->private_->frame.header.blocksize; i++)
+				side[i] += right[i];
+			break;
+		}
 		for(i = 0; i < decoder->private_->frame.header.blocksize; i++)
 			if(decoder->private_->side_subframe_in_use)
 				decoder->private_->output[0][i] = decoder->private_->output[1][i] + decoder->private_->side_subframe[i];
@@ -3500,6 +3515,20 @@ void undo_channel_coding(FLAC__StreamDecoder *decoder) {
 	case FLAC__CHANNEL_ASSIGNMENT_MID_SIDE:
 		FLAC__ASSERT(decoder->private_->frame.header.channels == 2);
 		FLAC__ASSERT(decoder->private_->side_subframe_in_use != /* logical XOR */ (decoder->private_->frame.header.bits_per_sample < 32));
+		if(!decoder->private_->side_subframe_in_use) {
+			FLAC__int32 *flac_restrict ch0 = decoder->private_->output[0];
+			FLAC__int32 *flac_restrict ch1 = decoder->private_->output[1];
+			for(i = 0; i < decoder->private_->frame.header.blocksize; i++) {
+				FLAC__int32 mid, side;
+				mid = ch0[i];
+				side = ch1[i];
+				mid = ((uint32_t) mid) << 1;
+				mid |= (side & 1); /* i.e. if 'side' is odd... */
+				ch0[i] = (mid + side) >> 1;
+				ch1[i] = (mid - side) >> 1;
+			}
+			break;
+		}
 		for(i = 0; i < decoder->private_->frame.header.blocksize; i++) {
 			if(!decoder->private_->side_subframe_in_use){
 				FLAC__int32 mid, side;
