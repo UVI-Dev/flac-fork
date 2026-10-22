@@ -419,7 +419,7 @@ FLAC__uint16 FLAC__crc16_update_words32(const FLAC__uint32 *words, uint32_t len,
 	return crc;
 }
 
-FLAC__uint16 FLAC__crc16_update_words64(const FLAC__uint64 *words, uint32_t len, FLAC__uint16 crc)
+static FLAC__uint16 crc16_update_words64_table_(const FLAC__uint64 *words, uint32_t len, FLAC__uint16 crc)
 {
 	while (len--) {
 		crc ^= words[0] >> 48;
@@ -434,3 +434,72 @@ FLAC__uint16 FLAC__crc16_update_words64(const FLAC__uint64 *words, uint32_t len,
 
 	return crc;
 }
+
+#if defined(__aarch64__) && (defined(__ARM_FEATURE_AES) || defined(__ARM_FEATURE_CRYPTO))
+#include <arm_neon.h>
+
+/* CRC-16 by folding with carry-less multiplications (PMULL), see "Fast CRC
+ * Computation for Generic Polynomials Using PCLMULQDQ Instruction" (Intel, 2009).
+ * The data is a polynomial over GF(2), first bit of the stream at the highest
+ * degree; a 64-bit word value already reads that way. A 128-bit accumulator
+ * (H:L) stays congruent modulo P to everything read so far: moving it 128 bits
+ * further is H * (x^192 mod P) + L * (x^128 mod P), which still fits in 128 bits
+ * since the constants have degree < 16. The CRC of the accumulator taken as 16
+ * bytes from a zero state is then the CRC of all the folded words.
+ * P = x^16 + x^15 + x^2 + 1 (0x8005). */
+/* acc * x^(128 * blocks) mod P, kept in 128 bits; k = { x^(128 * blocks) mod P, x^(128 * blocks + 64) mod P } */
+static inline uint64x2_t crc16_fold_(uint64x2_t acc, poly64x2_t k)
+{
+	return veorq_u64(
+		vreinterpretq_u64_p128(vmull_p64(vgetq_lane_p64(vreinterpretq_p64_u64(acc), 0), vgetq_lane_p64(k, 0))),
+		vreinterpretq_u64_p128(vmull_high_p64(vreinterpretq_p64_u64(acc), k)));
+}
+
+/* two words as an accumulator: lanes are (low 64 bits, high 64 bits) as in a
+ * product, so the first word goes high */
+static inline uint64x2_t crc16_load_block_(const FLAC__uint64 *words)
+{
+	const uint64x2_t v = vld1q_u64(words);
+	return vextq_u64(v, v, 1);
+}
+
+static FLAC__uint16 crc16_update_words64_pmull_(const FLAC__uint64 *words, uint32_t len, FLAC__uint16 crc)
+{
+	const poly64x2_t k128 = { 0x0106 /* x^128 mod P */, 0x1666 /* x^192 mod P */ };
+	const poly64x2_t k256 = { 0x8011 /* x^256 mod P */, 0x9323 /* x^320 mod P */ };
+	FLAC__uint64 tail[2];
+	uint64x2_t acc0, acc1;
+	uint32_t i;
+
+	/* Two accumulators take alternate 128-bit blocks, each folding 256 bits at a
+	 * time, so that the two multiply chains run in parallel. The running CRC is
+	 * the same as XORing it into the first 16 bits. */
+	acc0 = veorq_u64(crc16_load_block_(words), vcombine_u64(vcreate_u64(0), vcreate_u64((FLAC__uint64)crc << 48)));
+	acc1 = crc16_load_block_(words + 2);
+	for(i = 4; i + 4 <= len; i += 4) {
+		acc0 = veorq_u64(crc16_fold_(acc0, k256), crc16_load_block_(words + i));
+		acc1 = veorq_u64(crc16_fold_(acc1, k256), crc16_load_block_(words + i + 2));
+	}
+	acc0 = veorq_u64(crc16_fold_(acc0, k128), acc1);
+	if(i + 2 <= len) {
+		acc0 = veorq_u64(crc16_fold_(acc0, k128), crc16_load_block_(words + i));
+		i += 2;
+	}
+
+	tail[0] = vgetq_lane_u64(acc0, 1);
+	tail[1] = vgetq_lane_u64(acc0, 0);
+	crc = crc16_update_words64_table_(tail, 2, 0);
+	return crc16_update_words64_table_(words + i, len - i, crc);
+}
+
+FLAC__uint16 FLAC__crc16_update_words64(const FLAC__uint64 *words, uint32_t len, FLAC__uint16 crc)
+{
+	/* below a few words the table is as fast as setting the folding up */
+	return len >= 8 ? crc16_update_words64_pmull_(words, len, crc) : crc16_update_words64_table_(words, len, crc);
+}
+#else
+FLAC__uint16 FLAC__crc16_update_words64(const FLAC__uint64 *words, uint32_t len, FLAC__uint16 crc)
+{
+	return crc16_update_words64_table_(words, len, crc);
+}
+#endif
